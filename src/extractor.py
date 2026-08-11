@@ -27,6 +27,25 @@ _NMOS_REV_TYPES  = frozenset(range(18, 22))
 
 _SD_SWAP = {0: 2, 2: 0, 4: 6, 6: 4, 14: 16, 16: 14, 18: 20, 20: 18}
 
+# A MOSFET's source and drain are a PERMUTABLE pin group -- which terminal is which is
+# set by bias, not by topology -- so applying _SD_SWAP to a positive region yields the
+# IDENTICAL physical circuit.  Labelling it y=0 injects mislabelled POSITIVES.
+#
+# Verified against this repository's own VF3 ground truth.  All 18,042 matched instances
+# were canonically hashed twice, with drain/source as DISTINCT relations vs MERGED:
+#     match under BOTH conventions : 17,984  (99.68%)
+#     match ONLY with d/s MERGED   :     31  (0.17%)   <- VF3 permuted d/s here
+#     match ONLY with d/s STRICT   :      0  (0.00%)
+# Those 31 instances have a netlist drain/source assignment that DISAGREES with their
+# library cell, yet VF3 matched them.  That is only possible if VF3's matcher permutes
+# d/s.  Hence a d/s-swapped positive would still be matched by VF3, and y=0 contradicts
+# this project's own ground-truth oracle.
+#
+# Scale: neg_mut = 2,752 files; make_mutation_negative builds exactly two candidates and
+# random.sample picks one uniformly, so ~1,376 (~4.9% of all 27,832 negatives) are
+# mislabelled.  The P/N type-swap mutation is a genuine hard negative and is KEPT.
+DROP_DS_MUTATION = True
+
 def _load_json(path: Path) -> dict:
     with open(path, 'r') as f:
         return json.load(f)
@@ -111,7 +130,16 @@ def make_partial_negative(subgraph: Data) -> Data | None:
     neg.node_types = new_nt
     return neg
 
-def make_mutation_negative(subgraph: Data) -> list[Data]:
+def make_mutation_negative(subgraph: Data) -> list[tuple[str, Data]]:
+    """Returns [(variant, Data), ...] with variant in {'pn', 'ds'}.
+
+    'pn' swaps PMOS<->NMOS relation types    -- a genuine hard negative.
+    'ds' swaps drain<->source relation types -- NOT a negative; see DROP_DS_MUTATION.
+
+    Both variants are still constructed so that the random stream in extract_dataset is
+    unchanged; the 'ds' variant is discarded at the save site instead.  That keeps every
+    other negative type bit-identical to the pre-fix dataset, making this a clean ablation.
+    """
 
     results = []
 
@@ -137,7 +165,7 @@ def make_mutation_negative(subgraph: Data) -> list[Data]:
                                 edge_type=new_et_a)
         neg_a.num_nodes  = subgraph.num_nodes
         neg_a.node_types = subgraph.node_types
-        results.append(neg_a)
+        results.append(("pn", neg_a))
 
     sd_affected = torch.tensor([t.item() in _SD_SWAP for t in et], dtype=torch.bool)
 
@@ -150,7 +178,7 @@ def make_mutation_negative(subgraph: Data) -> list[Data]:
                                 edge_type=new_et_b)
         neg_b.num_nodes  = subgraph.num_nodes
         neg_b.node_types = subgraph.node_types
-        results.append(neg_b)
+        results.append(("ds", neg_b))
 
     return results
 
@@ -254,7 +282,7 @@ def extract_dataset(
     mut_rate  = float(negatives.get("mutation_per_pos", 0.25))
     oth_rate  = float(negatives.get("others_per_pos",   0.25))
 
-    tally = {k: 0 for k in ("pos", "rand", "part", "mut", "oth")}
+    tally = {k: 0 for k in ("pos", "rand", "part", "mut", "oth", "mut_ds_dropped")}
     file_idx = 0
 
     def _save(src, label, tag, tname):
@@ -334,8 +362,14 @@ def extract_dataset(
                 muts = make_mutation_negative(pos_sub)
                 if muts:
                     n_mut = min(_expected_count(mut_rate), len(muts))
-                    for mv in random.sample(muts, n_mut):
-                        _save(mv, 0.0, "neg_mut", tname); tally["mut"] += 1
+                    # Sample FIRST -- this preserves the original random stream exactly --
+                    # then discard the drain/source variant.  Every other negative type is
+                    # therefore bit-identical to the pre-fix dataset.
+                    for variant, mv in random.sample(muts, n_mut):
+                        if DROP_DS_MUTATION and variant == "ds":
+                            tally["mut_ds_dropped"] += 1
+                            continue
+                        _save(mv, 0.0, f"neg_mut_{variant}", tname); tally["mut"] += 1
 
                 for _ in range(_expected_count(oth_rate)):
                     other_names = [n for n in matches_by_target
@@ -359,7 +393,9 @@ def extract_dataset(
     print(f"  Positives          : {tally['pos']}")
     print(f"  Neg random         : {tally['rand']}")
     print(f"  Neg partial [hard] : {tally['part']}")
-    print(f"  Neg mutation[hard] : {tally['mut']}")
+    print(f"  Neg mutation[hard] : {tally['mut']}  (P/N type-swap only)")
+    print(f"  Neg mut d/s DROPPED: {tally['mut_ds_dropped']}  "
+          f"(mislabelled positives - see DROP_DS_MUTATION)")
     print(f"  Neg others         : {tally['oth']}")
     print(f"  Total negatives    : {total_neg}")
     if total_neg:

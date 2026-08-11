@@ -20,7 +20,7 @@ class CircuitFilterGNN(nn.Module):
         self.bns   = nn.ModuleList()
         prev = in_channels
         for _ in range(num_layers):
-            self.convs.append(RGCNConv(prev, hidden_channels, num_relations, num_bases=num_bases))
+            self.convs.append(RGCNConv(prev, hidden_channels, num_relations, num_bases=num_bases, aggr = 'add'))
             self.bns.append(nn.BatchNorm1d(hidden_channels))
             prev = hidden_channels
 

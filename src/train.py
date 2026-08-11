@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import random
 from pathlib import Path
@@ -64,7 +65,7 @@ def load_all_pt_files(dataset_dir: Path) -> list:
         if tname is None:
             missing_tag += 1
             continue
-        samples.append((_clean_graph(g, keep_label=True), tname))
+        samples.append((_clean_graph(g, keep_label=True), tname, p.name))
 
     if missing_tag:
         print(f"[WARN] {missing_tag} .pt files had no .target_name and were skipped.")
@@ -86,7 +87,7 @@ class PairDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, i):
-        cand, tname = self.samples[i]
+        cand, tname = self.samples[i][0], self.samples[i][1]
         return cand, self.targets[tname]
 
 def collate_pairs(batch):
@@ -94,25 +95,64 @@ def collate_pairs(batch):
     cands, tgts = zip(*batch)
     return Batch.from_data_list(list(cands)), Batch.from_data_list(list(tgts))
 
+_CKT_RE = re.compile(r'^(.*?)__')
+
 def split_dataset(
-    graphs: list[Data],
+    graphs: list,
     train_frac: float,
     val_frac: float,
     seed: int,
-) -> tuple[list[Data], list[Data], list[Data]]:
+) -> tuple[list, list, list]:
+    """Leave-circuits-out split.
 
-    random.seed(seed)
-    shuffled = graphs.copy()
-    random.shuffle(shuffled)
+    The previous implementation shuffled the flat sample list.  Because extractor.py
+    derives `neg_part` (parent minus ONE transistor) and `neg_mut` (identical node set
+    and edge_index, only edge_type perturbed) FROM a specific positive, a flat shuffle
+    scatters a positive and its own perturbations across different splits.
 
-    n        = len(shuffled)
-    n_train  = int(n * train_frac)
-    n_val    = int(n * val_frac)
+    Measured on this dataset (38,939 samples, seed 42, 70/15/15):
+        derived negatives (neg_part + neg_mut) : 8,304
+        separated from their parent positive   : 3,946  (47.5%)
+    i.e. 33.8% of val+test were near-duplicates of graphs seen during training, and all
+    25 circuits appeared in all three splits.  Reported recall was inflated accordingly.
 
-    train_set = shuffled[:n_train]
-    val_set   = shuffled[n_train : n_train + n_val]
-    test_set  = shuffled[n_train + n_val:]
+    Splitting by circuit also removes the overlap between K-hop regions centred on
+    adjacent transistors of the same netlist.
 
+    NOTE: with only 25 circuits this split is coarse and higher-variance than the old
+    one.  Run several seeds and report mean +/- std, not a single number.
+    """
+    by_ckt: dict = {}
+    for item in graphs:
+        fname = item[2] if len(item) > 2 else ""
+        m = _CKT_RE.match(fname)
+        by_ckt.setdefault(m.group(1) if m else "UNKNOWN", []).append(item)
+
+    ckts = sorted(by_ckt)
+    if len(ckts) < 3:
+        print(f"[WARN] only {len(ckts)} circuit group(s) found ({', '.join(ckts)}) -"
+              f" falling back to a flat shuffle. Expected filenames of the form"
+              f" '<CIRCUIT>__<TARGET>__NNNNNN_tag.pt'.")
+        shuffled = list(graphs)
+        random.Random(seed).shuffle(shuffled)
+        n = len(shuffled)
+        n_tr, n_va = int(n * train_frac), int(n * val_frac)
+        return shuffled[:n_tr], shuffled[n_tr:n_tr + n_va], shuffled[n_tr + n_va:]
+
+    random.Random(seed).shuffle(ckts)
+    n = len(ckts)
+    n_train = min(max(1, round(n * train_frac)), n - 2)
+    n_val   = min(max(1, round(n * val_frac)),   n - n_train - 1)
+
+    tr_c, va_c, te_c = ckts[:n_train], ckts[n_train:n_train + n_val], ckts[n_train + n_val:]
+    train_set = [x for c in tr_c for x in by_ckt[c]]
+    val_set   = [x for c in va_c for x in by_ckt[c]]
+    test_set  = [x for c in te_c for x in by_ckt[c]]
+
+    print(f"  Split             : leave-circuits-out (seed {seed})")
+    print(f"    train {len(tr_c):>2} ckts ({len(train_set):>6} samples): {', '.join(tr_c)}")
+    print(f"    val   {len(va_c):>2} ckts ({len(val_set):>6} samples): {', '.join(va_c)}")
+    print(f"    test  {len(te_c):>2} ckts ({len(test_set):>6} samples): {', '.join(te_c)}")
     return train_set, val_set, test_set
 
 def resolve_pos_weight(
@@ -126,8 +166,8 @@ def resolve_pos_weight(
         print(f"  pos_weight        : {w:.2f}  (from config)")
         return torch.tensor([w], device=device)
 
-    num_pos = sum(1 for cand, _ in train_graphs if cand.y.item() == 1)
-    num_neg = sum(1 for cand, _ in train_graphs if cand.y.item() == 0)
+    num_pos = sum(1 for cand, *_ in train_graphs if cand.y.item() == 1)
+    num_neg = sum(1 for cand, *_ in train_graphs if cand.y.item() == 0)
 
     if num_pos == 0:
         print("[WARN] No positive examples in training split — defaulting pos_weight to 1.0")
@@ -274,8 +314,8 @@ def train(cfg_path: Path) -> None:
     best_val_score = 0.0
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_train_pos = sum(1 for cand, _ in train_graphs if cand.y.item() == 1)
-    n_train_neg = sum(1 for cand, _ in train_graphs if cand.y.item() == 0)
+    n_train_pos = sum(1 for cand, *_ in train_graphs if cand.y.item() == 1)
+    n_train_neg = sum(1 for cand, *_ in train_graphs if cand.y.item() == 0)
 
     sep = "─" * 52
     print(f"\n{sep}")
